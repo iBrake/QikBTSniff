@@ -32,7 +32,7 @@ This collation of the information also makes it much easier to process for the r
 **Current state?**
 
 Currently QikBTSniff is at V0.01, this version will currently preform the active scan session as per the settings in the configuration file.
-If you'd like to try this, the latest compiled version is in the bin folder. Just download QikBTSniff and QikBTSniff.cfg to the same folder on your linux machine and run with ./QikBTSniff
+If you'd like to try this, the latest compiled version is in the bin folder. Just download QikBTSniff and QikBTSniff.cfg to the same folder on your Linux machine and run with ./QikBTSniff 
 Currently only tested on Ubuntu 24.04, but the main dependencies have been included with Ubuntu since 14.
 The application needs su due to interacting with HCI.
 By default, it will look for any sensor using HCI0 and scan for ten minutes. After ensuring that it runs fine with the defaults, you can try altering the cfg file to your liking. MAC filtering is highly desirable as it allows us to clear the queue quicker and get packets from our desired sensors faster. All the options are explained in the cfg file.
