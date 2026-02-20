@@ -15,16 +15,16 @@ The Bluetooth advertising spectrum can be incredibly busy and low power sensors 
 Long term tests with conventional JavaScript and python libraries have showed frequent gaps of up to 15 minutes between received packets from a sensor sending once every 10 seconds. This means 90 packets missed!
 While that's an extreme example, it's clear that we can do better.
 
-3. *Sensor Battery Life Vs Information*
+2. *Sensor Battery Life Vs Information*
    
 The first issue is that the majority of the current libraries will use "active" Bluetooth scanning. This means for a full received packet, we have to respond to the sensors advertising packet, and then have it respond back. This duplicates the amount of packets the sensor has to send and has effects on battery life, however it also effects reliability as we need three packets in total to be successful before we have the full data required.
 QikBTSniff first uses active mode to scan for sensors and saves the information about the sensor. After the initial scan, QikBTSniff switches to passive scanning, which just requires receiving a packet from the sensor. It then uses the initial information it gathered so it can collate the sensors variable information with the static. This gives the advantages of both active and passive scanning.
 
-5. *Bluetooth hardware can be flakey*
+3. *Bluetooth hardware can be flakey*
    
 One of the issues with current Bluetooth AD scanners is that they handle failure very poorly. In particular, some that require external daemons might need an entire application to be restarted, or even Linux itself, before being able to revive an adapter. QikBTSniff runs each Bluetooth scanning process in a separate thread that is restarted periodically. This means even "silent failures" should fix themselves.
 
-7. *Easy incorporation of Bluetooth sensors to other projects*
+4. *Easy incorporation of Bluetooth sensors to other projects*
    
 While you can write something simple in Python to start listening for Bluetooth advertising packets, the information above gives a few of the multitude of reasons why you shouldn't. QikBTSniff collates the advertising packets and periodically sends them over TCP. This means any application can simply open a TCP port and start receiving reliable Bluetooth advertising information without worrying about the hardware side.
 This collation of the information also makes it much easier to process for the receiving application as well as the data is structured in an easy to read JSON for each sensor QikBTSniff is monitoring.
