@@ -17,7 +17,7 @@ While that's an extreme example, it's clear that we can do better.
 
 2. *Sensor Battery Life Vs Information*
    
-The first issue is that the majority of the current libraries will use "active" Bluetooth scanning. This means for a full received packet, we have to respond to the sensors advertising packet, and then have it respond back. This duplicates the amount of packets the sensor has to send and has effects on battery life, however it also effects reliability as we need three packets in total to be successful before we have the full data required.
+The majority of the current libraries will use "active" Bluetooth scanning. This means for a full received packet, we have to respond to the sensors advertising packet, and then have it respond back. This duplicates the amount of packets the sensor has to send and has effects on battery life, however it also effects reliability as we need three packets in total to be successful before we have the full data required.
 QikBTSniff first uses active mode to scan for sensors and saves the information about the sensor. After the initial scan, QikBTSniff switches to passive scanning, which just requires receiving a packet from the sensor. It then uses the initial information it gathered so it can collate the sensors variable information with the static. This gives the advantages of both active and passive scanning.
 
 3. *Bluetooth hardware can be flakey*
