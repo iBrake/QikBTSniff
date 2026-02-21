@@ -24,11 +24,7 @@ QikBTSniff first uses active mode to scan for sensors and saves the information 
 
 One of the issues with current Bluetooth AD scanners is that they handle failure very poorly. In particular, some that require external daemons might need an entire application to be restarted, or even Linux itself, before being able to revive an adapter. QikBTSniff runs each Bluetooth scanning process in a separate thread that is restarted periodically. This means even "silent failures" should fix themselves.
 
-4. *Bluetooth hardware can be flakey*
-   
-One of the issues with current Bluetooth AD scanners is that they handle failure very poorly. In particular, some that require external daemons might need an entire application to be restarted, or even Linux itself, before being able to revive an adapter. QikBTSniff runs each Bluetooth scanning process in a separate thread that is restarted periodically. This means even "silent failures" should fix themselves.
-
-5. *Easy incorporation of Bluetooth sensors to other projects*
+4. *Easy incorporation of Bluetooth sensors to other projects*
    
 While you can write something simple in Python to start listening for Bluetooth advertising packets, the information above gives a few of the multitude of reasons why you shouldn't. QikBTSniff collates the advertising packets and periodically sends them over TCP. This means any application can simply open a TCP port and start receiving reliable Bluetooth advertising information without worrying about the hardware side.
 This collation of the information also makes it much easier to process for the receiving application as well as the data is structured in an easy to read JSON for each sensor QikBTSniff is monitoring.
