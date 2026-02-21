@@ -233,15 +233,28 @@ int DeviceFinder(Config cfg) {
 	unsigned StartTime = (unsigned)time(NULL);
 	
 	int device = hci_open_dev(cfg.HCI[0]);
+	char resetString[25];
+	sprintf(resetString, "hciconfig hci%d reset", cfg.HCI[0]);
+	printf("%s\n", resetString);
+
+	//There's odd things that can happen where the adapter gets stuck. A reset can help.
+	if (system(resetString) != 0) {
+		printf("Reset failed\n");
+	}
+
+	int scanIntervalWindow = 0x78;
+	// printf("Scan interval and window set to %0.fms", (scanIntervalWindow*0.625));
+	// printf("\n");
 	
 	// Set BLE scan parameters.
 	le_set_scan_parameters_cp scan_params_cp;
 	memset(&scan_params_cp, 0, sizeof(scan_params_cp));
 	scan_params_cp.type = 0x01;
-	scan_params_cp.interval = htobs(0x0010);
-	scan_params_cp.window = htobs(0x0010);
+	scan_params_cp.interval = htobs(scanIntervalWindow);
+	scan_params_cp.window = htobs(scanIntervalWindow);
 	scan_params_cp.own_bdaddr_type = 0x00; // Public Device Address (default).
 	scan_params_cp.filter = 0x00; // Accept all.
+	
 
 	struct hci_request scan_params_rq = ble_hci_request(OCF_LE_SET_SCAN_PARAMETERS, LE_SET_SCAN_PARAMETERS_CP_SIZE, &status, &scan_params_cp);
 
@@ -283,6 +296,10 @@ int DeviceFinder(Config cfg) {
 	memset(&scan_cp, 0, sizeof(scan_cp));
 	scan_cp.enable = 0x01;	// Enable flag.
 	scan_cp.filter_dup = 0x00; // Filtering disabled.
+	//It seems like we'd want filtering of duplicates enabled for this scan, but even the BlueZ devs have mentioned it causing "weirdness"
+	//I have tested it and at first glance, it appears to work fine, but then certain devices just won't show up.
+	//I've also had a device respond to requests fine, but completely stop actually giving out any messages.
+	//Our current filtering is so fast that it's not a concern anyway.
 
 	struct hci_request enable_adv_rq = ble_hci_request(OCF_LE_SET_SCAN_ENABLE, LE_SET_SCAN_ENABLE_CP_SIZE, &status, &scan_cp);
 
@@ -318,8 +335,18 @@ int DeviceFinder(Config cfg) {
 
 	while ((now < EndTime) && (deviceCount < cfg.max_devices))
 	{
-		len = read(device, buf, sizeof(buf));
-
+		fd_set readfds;
+		FD_ZERO(&readfds);
+		FD_SET(device, &readfds);
+		struct timeval tv = {0, 100000};  // must be reset each iteration
+		if (select(device + 1, &readfds, NULL, NULL, &tv) > 0) {
+			len = read(device, buf, sizeof(buf));
+		} else {
+			now = (unsigned)time(NULL);
+			continue;
+		}
+	
+		
 		if (len >= HCI_EVENT_HDR_SIZE)
 		{
 			msgCount++;
@@ -363,6 +390,9 @@ int DeviceFinder(Config cfg) {
 						continue; // back to start of while loop. Check next report for the event type.
 					}
 					
+					//This second mac filter adds processing time and will rarely be hit.
+					//Chances of the mac address being in a packet, but it not being the mac of the device are very low.
+					//However it *will* happen eventually, so this removes these packets.
 					if (cfg.mac_filter_en)
 					{
 						int found = FALSE;
@@ -405,7 +435,7 @@ int DeviceFinder(Config cfg) {
 					{
 						uint8_t len = info->data[i];
 						uint8_t type = info->data[i + 1];
-						if (type == 0x08 || type == 0x09)
+						if (type == 0x08 || type == 0x09)//Name
 						{
 							char name[32] = {0};
 							int data_len = len - 1;
@@ -429,14 +459,15 @@ int DeviceFinder(Config cfg) {
 								deviceCount++;
 								if (cfg.verbose)
 								{
-									printf("New!:%s - Name: %-30s - Devices found: %-3d - Time Remain: %d\n",
+									printf("New!:%s - Name: %-30s - Devices found: %-3d - Time Remain: %d",
 										   addr, name, deviceCount, (EndTime - now));
+										   printf("\n");
 								}
 							}
 						}
 						i += len + 1; // only reached if type didn't match
 					}
-					offset = info->data + info->length + 2; // advance to next report
+					
 				}
 			}
 		}
