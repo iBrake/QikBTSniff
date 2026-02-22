@@ -49,6 +49,70 @@ MacFilter prepare_mac_filters(Config* cfg) {
 	return result;
 }
 
+int bt_start_scan(int device, int* status, int enable) {
+
+
+	int scanIntervalWindow = 0x78;
+	le_set_scan_enable_cp scan_cp;
+
+	if (enable) {
+		// Scan parameters
+		le_set_scan_parameters_cp scan_params_cp;
+		memset(&scan_params_cp, 0, sizeof(scan_params_cp));
+		scan_params_cp.type = 0x01;
+		scan_params_cp.interval = htobs(scanIntervalWindow);
+		scan_params_cp.window = htobs(scanIntervalWindow);
+		scan_params_cp.own_bdaddr_type = 0x00;
+		scan_params_cp.filter = 0x00;
+
+		struct hci_request scan_params_rq = ble_hci_request(OCF_LE_SET_SCAN_PARAMETERS, LE_SET_SCAN_PARAMETERS_CP_SIZE, status, &scan_params_cp);
+		if (hci_send_req(device, &scan_params_rq, 1000) < 0) {
+			perror("Failed to set scan parameters");
+			return -1;
+		}
+
+		// Event mask
+		le_set_event_mask_cp event_mask_cp;
+		memset(&event_mask_cp, 0, sizeof(le_set_event_mask_cp));
+		for (int i = 0; i < 8; i++) event_mask_cp.mask[i] = 0xFF;
+		struct hci_request set_mask_rq = ble_hci_request(OCF_LE_SET_EVENT_MASK, LE_SET_EVENT_MASK_CP_SIZE, status, &event_mask_cp);
+		if (hci_send_req(device, &set_mask_rq, 1000) < 0) {
+			perror("Failed to set event mask");
+			return -1;
+		}
+
+		// Enable scanning
+		le_set_scan_enable_cp scan_cp;
+		memset(&scan_cp, 0, sizeof(scan_cp));
+		scan_cp.enable = 0x01; // Enable flag.
+		scan_cp.filter_dup = 0x00;// Filtering disabled.
+		//It seems like we'd want filtering of duplicates enabled for this scan, but even the BlueZ devs have mentioned it causing "weirdness"
+		//I have tested it and at first glance, it appears to work fine, but then certain devices just won't show up.
+		//I've also had a device respond to requests fine, but completely stop actually giving out any messages.
+		//Our current filtering is so fast that it's not a concern anyway.
+		struct hci_request enable_adv_rq = ble_hci_request(OCF_LE_SET_SCAN_ENABLE, LE_SET_SCAN_ENABLE_CP_SIZE, status, &scan_cp);
+		if (hci_send_req(device, &enable_adv_rq, 1000) < 0) {
+			perror("Failed to enable scan");
+			return -1;
+		}
+	}
+	else
+	{
+		// Disable scanning.
+		memset(&scan_cp, 0, sizeof(scan_cp));
+		struct hci_request disable_adv_rq = ble_hci_request(OCF_LE_SET_SCAN_ENABLE, LE_SET_SCAN_ENABLE_CP_SIZE, &status, &scan_cp);
+		int ret = hci_send_req(device, &disable_adv_rq, 1000);
+		if (ret < 0) {
+			hci_close_dev(device);
+			perror("Failed to disable scan.");
+			return -1;
+		}
+
+	}
+	return 0;
+}
+
+
 int DeviceFinder(Config cfg) {
 
 	int ret, status;
@@ -68,23 +132,7 @@ int DeviceFinder(Config cfg) {
 		printf("Device Reset failed\n");
 	}
 
-	int scanIntervalWindow = 0x78;
-	// printf("Scan interval and window set to %0.fms\n", (scanIntervalWindow * 0.625));
-	// printf("\n");
-
-	// Set BLE scan parameters.
-	le_set_scan_parameters_cp scan_params_cp;
-	memset(&scan_params_cp, 0, sizeof(scan_params_cp));
-	scan_params_cp.type = 0x01;
-	scan_params_cp.interval = htobs(scanIntervalWindow);
-	scan_params_cp.window = htobs(scanIntervalWindow);
-	scan_params_cp.own_bdaddr_type = 0x00; // Public Device Address (default).
-	scan_params_cp.filter = 0x00; // Accept all.
-
-
-	struct hci_request scan_params_rq = ble_hci_request(OCF_LE_SET_SCAN_PARAMETERS, LE_SET_SCAN_PARAMETERS_CP_SIZE, &status, &scan_params_cp);
-
-	ret = hci_send_req(device, &scan_params_rq, 1000);
+	ret = bt_start_scan(device, &status, TRUE);
 	if (ret < 0) {
 		if (errno == EACCES || errno == EPERM) {
 			fprintf(stderr, "HCI Permission denied. Try running as root.\n");
@@ -96,42 +144,8 @@ int DeviceFinder(Config cfg) {
 		return -1;
 	}
 
-
 	printf("Using bluetooth device %d and will scan for up to %d seconds or %d devices are found.", device, cfg.initial_scan_time, cfg.max_devices);
 	printf("\n");
-
-
-	// Set BLE events report mask.
-	le_set_event_mask_cp event_mask_cp;
-	memset(&event_mask_cp, 0, sizeof(le_set_event_mask_cp));
-	int i = 0;
-	for (i = 0; i < 8; i++) event_mask_cp.mask[i] = 0xFF;
-
-	struct hci_request set_mask_rq = ble_hci_request(OCF_LE_SET_EVENT_MASK, LE_SET_EVENT_MASK_CP_SIZE, &status, &event_mask_cp);
-	ret = hci_send_req(device, &set_mask_rq, 1000);
-	if (ret < 0) {
-		hci_close_dev(device);
-		perror("Failed to set event mask.");
-		return -1;
-	}
-
-	// Enable scanning.
-	le_set_scan_enable_cp scan_cp;
-	memset(&scan_cp, 0, sizeof(scan_cp));
-	scan_cp.enable = 0x01;	// Enable flag.
-	scan_cp.filter_dup = 0x00; // Filtering disabled.
-	//It seems like we'd want filtering of duplicates enabled for this scan, but even the BlueZ devs have mentioned it causing "weirdness"
-	//I have tested it and at first glance, it appears to work fine, but then certain devices just won't show up.
-	//I've also had a device respond to requests fine, but completely stop actually giving out any messages.
-	//Our current filtering is so fast that it's not a concern anyway.
-
-	struct hci_request enable_adv_rq = ble_hci_request(OCF_LE_SET_SCAN_ENABLE, LE_SET_SCAN_ENABLE_CP_SIZE, &status, &scan_cp);
-
-	ret = hci_send_req(device, &enable_adv_rq, 1000);
-	if (ret < 0) {
-		perror("Failed to enable scan.");
-		return -1;
-	}
 
 	// Get Results.
 	struct hci_filter nf;
@@ -236,8 +250,6 @@ int DeviceFinder(Config cfg) {
 						}
 					}
 
-
-
 					char addr[18];
 					ba2str(&(info->bdaddr), addr);
 					// Check if we already know this device.
@@ -310,11 +322,7 @@ int DeviceFinder(Config cfg) {
 	printf("Devices found: %d \n", deviceCount);
 
 	// Disable scanning.
-	memset(&scan_cp, 0, sizeof(scan_cp));
-	scan_cp.enable = 0x00;	// Disable flag.
-
-	struct hci_request disable_adv_rq = ble_hci_request(OCF_LE_SET_SCAN_ENABLE, LE_SET_SCAN_ENABLE_CP_SIZE, &status, &scan_cp);
-	ret = hci_send_req(device, &disable_adv_rq, 1000);
+	ret = bt_start_scan(device, &status, FALSE);
 	if (ret < 0) {
 		hci_close_dev(device);
 		perror("Failed to disable scan.");
@@ -325,3 +333,5 @@ int DeviceFinder(Config cfg) {
 
 	return deviceCount;
 }
+
+
