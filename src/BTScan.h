@@ -34,6 +34,7 @@ typedef struct {
 
 struct hci_request ble_hci_request(uint16_t ocf, int clen, void* status, void* cparam);
 
+
 //Used for tracking found devices and names.
 typedef struct {
 	char mac[18];
@@ -47,8 +48,18 @@ typedef struct {
 	uint8_t bytes[10][3];
 	int count;
 } MacFilter;
-MacFilter prepare_mac_filters(Config*);
+MacFilter prepare_mac_manu_filters(Config*);
+
+//used later for device filter during passive scanning.
+typedef struct {
+	uint8_t bytes[100][6];
+	int count;
+} DeviceMacsToFind;
+
+DeviceMacsToFind build_mac_dev_filters(DeviceInfo*, int);
+
 
 int DeviceFinder(Config);
 int find_or_add(const char*, const char*, int);
+int AdFinder(int, DeviceMacsToFind, int, int, int);
 #endif

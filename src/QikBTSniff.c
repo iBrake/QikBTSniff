@@ -14,6 +14,20 @@
 #define	TRUE 1
 #define	FALSE 0
 
+//Below two structs for our data collating.
+typedef struct {
+	uint16_t uuid;
+	uint8_t  data[31];
+	uint8_t  data_len;
+} UUIDPayload;
+
+typedef struct {
+	uint8_t     mac[6];
+	UUIDPayload payloads[12];
+	int         payload_count;
+	time_t      last_seen;
+} DeviceRecord;
+
 
 void load_config(const char* filename, Config* config, int verbose);
 
@@ -26,6 +40,7 @@ int main(){
 
 	//Initial scan just uses one adapter.
 	int deviceCount = DeviceFinder(config);
+	//"devices" created in BTscan.c
 	if (deviceCount < 1)
 	{
 		printf("Either no devices found or an error occured! End!\n");
@@ -39,6 +54,25 @@ int main(){
 			printf("%s  %-30s  response count: %d\n", devices[i].mac, devices[i].name, devices[i].count);
 		}
 	}
+
+	DeviceMacsToFind DMTF = build_mac_dev_filters(devices, deviceCount);
+	//printf("\n--- Formatted MACs for filter ---\n");
+
+	//for (int i = 0; i < DMTF.count; i++) //.count in case broken MACs passed in, but this shouldn't happen.
+	//{
+	//	printf("%02X:%02X:%02X:%02X:%02X:%02X\n",
+	//		DMTF.bytes[i][0],
+	//		DMTF.bytes[i][1],
+	//		DMTF.bytes[i][2],
+	//		DMTF.bytes[i][3],
+	//		DMTF.bytes[i][4],
+	//		DMTF.bytes[i][5]);
+	//}
+
+	printf("\nLauching ad finder\n");
+
+	//AdFinder(int HCI, DeviceMacsToFind MacsToFind, int Timeout, int intervalms, int debug_lvl) {
+	AdFinder(config.HCI[0], DMTF, 300, 70, 3);
 }
 
 void load_config(const char* filename, Config* config, int verbose) {

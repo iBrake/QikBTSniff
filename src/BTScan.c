@@ -31,7 +31,7 @@ int find_or_add(const char* mac, const char* name, int deviceCount) {
 
 //function I got from Claude to turn our mac string into byte arrays that can be searched with memmem
 //Purpose of this is to kick out faster if the mac doesn't even appear in the buffer.
-MacFilter prepare_mac_filters(Config* cfg) {
+MacFilter prepare_mac_manu_filters(Config* cfg) {
 	MacFilter result = { 0 };
 	char temp[128];
 	strncpy(temp, cfg->mac_filter, sizeof(temp));
@@ -49,19 +49,49 @@ MacFilter prepare_mac_filters(Config* cfg) {
 	return result;
 }
 
-int bt_start_scan(int device, int* status, int enable) {
+//This is the full device macs we want to find in LSB for searching through the HCI packet in passive scan mode.
+DeviceMacsToFind build_mac_dev_filters(DeviceInfo* devices, int device_count)
+{
+	DeviceMacsToFind result;
+	result.count = 0;
+
+	for (int i = 0; i < device_count && result.count < 100; i++)
+	{
+		unsigned int b0, b1, b2, b3, b4, b5;
+
+		if (sscanf(devices[i].mac, "%x:%x:%x:%x:%x:%x",
+			&b0, &b1, &b2, &b3, &b4, &b5) != 6)
+		{
+			printf("Malformed MAC in filter!!\n");
+			continue;  // skip malformed MAC
+		}
+
+		// last 3 bytes of MAC, reversed for wire order
+		result.bytes[result.count][0] = (uint8_t)b5;
+		result.bytes[result.count][1] = (uint8_t)b4;
+		result.bytes[result.count][2] = (uint8_t)b3;
+		result.bytes[result.count][3] = (uint8_t)b2;
+		result.bytes[result.count][4] = (uint8_t)b1;
+		result.bytes[result.count][5] = (uint8_t)b0;
+
+		result.count++;
+	}
+
+	return result;
+}
+
+int bt_start_scan(int device, int* status, int enable, int interval, int ScanType) {
 
 
-	int scanIntervalWindow = 0x78;
 	le_set_scan_enable_cp scan_cp;
 
 	if (enable) {
 		// Scan parameters
 		le_set_scan_parameters_cp scan_params_cp;
 		memset(&scan_params_cp, 0, sizeof(scan_params_cp));
-		scan_params_cp.type = 0x01;
-		scan_params_cp.interval = htobs(scanIntervalWindow);
-		scan_params_cp.window = htobs(scanIntervalWindow);
+		scan_params_cp.type = ScanType;
+		scan_params_cp.interval = htobs(interval);
+		scan_params_cp.window = htobs(interval);
 		scan_params_cp.own_bdaddr_type = 0x00;
 		scan_params_cp.filter = 0x00;
 
@@ -112,6 +142,153 @@ int bt_start_scan(int device, int* status, int enable) {
 	return 0;
 }
 
+int AdFinder(int HCI, DeviceMacsToFind MacsToFind, int Timeout, int intervalms, int debug_lvl) {
+
+	int ret, status;
+	unsigned now = (unsigned)time(NULL);
+	unsigned StartTime = (unsigned)time(NULL);
+
+	int device = hci_open_dev(HCI);
+	char resetString[25];
+
+	sprintf(resetString, "hciconfig hci%d reset", HCI);
+	//printf("%s\n", resetString);
+	//There's odd things that can happen where the adapter gets stuck. A reset can help.
+	if (system(resetString) != 0) {
+		printf("Device Reset failed\n");
+	}
+
+	ret = bt_start_scan(device, &status, TRUE, (intervalms / 0.625), 0x00);
+	if (ret < 0) {
+		if (errno == EACCES || errno == EPERM) {
+			fprintf(stderr, "HCI Permission denied. Try running as root.\n");
+		}
+		else
+		{
+			perror("Failed to set scan parameters data");
+		}
+		return -1;
+	}
+
+	if (debug_lvl) {
+		printf("Using bluetooth device %d, and resetting every %d seconds.", device, Timeout);
+		printf("\n");
+	}
+
+	// Get Results.
+	struct hci_filter nf;
+	hci_filter_clear(&nf);
+	hci_filter_set_ptype(HCI_EVENT_PKT, &nf);
+	hci_filter_set_event(EVT_LE_META_EVENT, &nf);
+	if (setsockopt(device, SOL_HCI, HCI_FILTER, &nf, sizeof(nf)) < 0) {
+		hci_close_dev(device);
+		perror("Could not set socket options\n");
+		return -1;
+	}
+
+	uint8_t buf[HCI_MAX_EVENT_SIZE];
+	evt_le_meta_event* meta_event;
+	le_advertising_info* info;
+	int len;
+	int MsgCount = 0;
+
+
+	//Testing out a first byte bucket to see if we get a speed boost.
+	uint64_t buckets[256] = { 0 };  //supports up to 64 MACs
+	for (int i = 0; i < MacsToFind.count; i++)
+		buckets[MacsToFind.bytes[i][0]] |= (1ULL << i);
+
+
+	while (MsgCount < 1000)
+	{
+		fd_set readfds;
+		FD_ZERO(&readfds);
+		FD_SET(device, &readfds);
+		struct timeval tv = { 0, 100000 };  // must be reset each iteration
+		if (select(device + 1, &readfds, NULL, NULL, &tv) > 0) {
+			len = read(device, buf, sizeof(buf));
+		}
+		else {
+			now = (unsigned)time(NULL);
+			continue;
+		}
+
+
+		if (len >= 14)
+		{
+			/* Before trying first byte bucket
+			for (int i = 0; i < MacsToFind.count; i++)
+			{
+				uint8_t* match = memmem(buf, len, MacsToFind.bytes[i], 6);
+				*/
+			for (int pos = 0; pos < len - 5; pos++)
+			{
+				uint64_t candidates = buckets[buf[pos]];
+				while (candidates)
+				{
+					int i = __builtin_ctzll(candidates);  // index of lowest set bit
+					candidates &= candidates - 1;          // clear lowest set bit
+
+					if (memcmp(&buf[pos], MacsToFind.bytes[i], 6) == 0)
+					{
+						uint8_t* match = &buf[pos];
+						//printf("match! %d\n", MsgCount);
+						MsgCount++;
+						//data length byte immediately follows the 6 byte MAC
+						uint8_t* data_len_ptr = match + 6;
+
+						if (data_len_ptr < buf + len)//In case of corrupt buffer. NB: memory pointers!! so checking that the ptr isn't telling us to go beyond the data we have.
+						{
+							uint8_t data_len = *data_len_ptr;
+							if (data_len_ptr + 1 + data_len <= buf + len)
+								//previous check seems pointless with this here, but we need to do previous check first to ensure data_len_ptr isn't rubbish, as this could then make us think this is valid...
+							{
+								uint8_t* payload = data_len_ptr + 1;
+								//payload is now pointing at data_len bytes of advertising data
+								//Can pass back to our coallating thread now.
+								//if (debug_lvl > 2) {
+
+								//	printf("MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+								//		MacsToFind.bytes[i][0],
+								//		MacsToFind.bytes[i][1],
+								//		MacsToFind.bytes[i][2],
+								//		MacsToFind.bytes[i][3],
+								//		MacsToFind.bytes[i][4],
+								//		MacsToFind.bytes[i][5]);
+
+								//	printf("Payload (%d bytes from %d bytes): ", data_len, len);
+								//	for (int i = 0; i < data_len; i++)
+								//	{
+								//		printf("%02X,", payload[i]);
+								//	}
+									printf("\nMsg:%d\n", MsgCount);
+								//}
+							}
+						}
+					
+					}
+				}
+			}
+		}
+	}
+		// Disable scanning.
+		ret = bt_start_scan(device, &status, FALSE, 0, 0);
+		if (ret < 0) {
+			hci_close_dev(device);
+			perror("Failed to disable scan.");
+			return -1;
+		}
+		else {
+			printf("Closed scan!\n");
+		}
+
+		hci_close_dev(device);
+
+		return 1;
+}
+
+
+
 
 int DeviceFinder(Config cfg) {
 
@@ -132,7 +309,7 @@ int DeviceFinder(Config cfg) {
 		printf("Device Reset failed\n");
 	}
 
-	ret = bt_start_scan(device, &status, TRUE);
+	ret = bt_start_scan(device, &status, TRUE, 0x78, 0x01);
 	if (ret < 0) {
 		if (errno == EACCES || errno == EPERM) {
 			fprintf(stderr, "HCI Permission denied. Try running as root.\n");
@@ -168,7 +345,7 @@ int DeviceFinder(Config cfg) {
 
 	MacFilter mac_filter;
 	if (cfg.mac_filter_en)
-		mac_filter = prepare_mac_filters(&cfg);
+		mac_filter = prepare_mac_manu_filters(&cfg);
 
 	while ((now < EndTime) && (deviceCount < cfg.max_devices))
 	{
@@ -322,7 +499,7 @@ int DeviceFinder(Config cfg) {
 	printf("Devices found: %d \n", deviceCount);
 
 	// Disable scanning.
-	ret = bt_start_scan(device, &status, FALSE);
+	ret = bt_start_scan(device, &status, FALSE, 0 ,0);
 	if (ret < 0) {
 		hci_close_dev(device);
 		perror("Failed to disable scan.");
