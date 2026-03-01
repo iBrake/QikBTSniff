@@ -29,8 +29,14 @@ int find_or_add(const char* mac, const char* name, int deviceCount) {
 	return FALSE;
 }
 
-//function I got from Claude to turn our mac string into byte arrays that can be searched with memmem
-//Purpose of this is to kick out faster if the mac doesn't even appear in the buffer.
+//Minmum HDR size we're ever interested in, throws out any unneeded info from the device.
+int MinEventSize =
+HCI_EVENT_HDR_SIZE +
+sizeof(evt_le_meta_event) +
+sizeof(le_advertising_info)
++ 4; //The absolute minimum structure for a 1 character name. Also the same size as the min for a passive packet.
+
+//Purpose of this is to kick out faster if the mac doesn't even appear in the buffer. Used only in active scan mode.
 MacFilter prepare_mac_manu_filters(Config* cfg) {
 	MacFilter result = { 0 };
 	char temp[128];
@@ -66,7 +72,7 @@ DeviceMacsToFind build_mac_dev_filters(DeviceInfo* devices, int device_count)
 			continue;  // skip malformed MAC
 		}
 
-		// last 3 bytes of MAC, reversed for wire order
+		// last 3 bytes of MAC, reversed for byte stream order
 		result.bytes[result.count][0] = (uint8_t)b5;
 		result.bytes[result.count][1] = (uint8_t)b4;
 		result.bytes[result.count][2] = (uint8_t)b3;
@@ -193,10 +199,20 @@ int AdFinder(int HCI, DeviceMacsToFind MacsToFind, int Timeout, int intervalms, 
 	int MsgCount = 0;
 
 
-	//Testing out a first byte bucket to see if we get a speed boost.
-	uint64_t buckets[256] = { 0 };  //supports up to 64 MACs
+	////Testing out a first byte bucket to see if we get a speed boost.
+	//If we have a boost from this, it's very small, it's not doing any harm at least, so will leave it.
+	//Think I'm currently at what we can realistically handle in terms of messages per second, per adapter now.
+	//FUTHER UPDATE:
+	//Using just one byte was a mistake, as:
+	// 1. It can be 00, which appears very frequently in packets.
+	// 2. At least for my 10 devices, the last byte can be similar, even the same. (probably the maufacturer masking some bits?)
+	//Going to switch to using the last byte of the manufacturer ID and the first byte of the Maufacturer data.
+	//The manufacturer byte is unlikely to be 00, and the data part is more likely to be random.
+	uint64_t buckets[256][256] = { 0 };
+
+	// Build index using bytes 4 and 5
 	for (int i = 0; i < MacsToFind.count; i++)
-		buckets[MacsToFind.bytes[i][0]] |= (1ULL << i);
+		buckets[MacsToFind.bytes[i][4]][MacsToFind.bytes[i][5]] |= (1ULL << i);
 
 
 	while (MsgCount < 1000)
@@ -214,7 +230,7 @@ int AdFinder(int HCI, DeviceMacsToFind MacsToFind, int Timeout, int intervalms, 
 		}
 
 
-		if (len >= 14)
+		if (len >= MinEventSize)
 		{
 			/* Before trying first byte bucket
 			for (int i = 0; i < MacsToFind.count; i++)
@@ -223,12 +239,11 @@ int AdFinder(int HCI, DeviceMacsToFind MacsToFind, int Timeout, int intervalms, 
 				*/
 			for (int pos = 0; pos < len - 5; pos++)
 			{
-				uint64_t candidates = buckets[buf[pos]];
+				uint64_t candidates = buckets[buf[pos + 4]][buf[pos + 5]];
 				while (candidates)
 				{
-					int i = __builtin_ctzll(candidates);  // index of lowest set bit
-					candidates &= candidates - 1;          // clear lowest set bit
-
+					int i = __builtin_ctzll(candidates);
+					candidates &= candidates - 1;
 					if (memcmp(&buf[pos], MacsToFind.bytes[i], 6) == 0)
 					{
 						uint8_t* match = &buf[pos];
@@ -299,6 +314,8 @@ int DeviceFinder(Config cfg) {
 	unsigned EndTime = now + cfg.initial_scan_time;
 	unsigned StartTime = (unsigned)time(NULL);
 
+	//printf("HCI from config: %d", cfg.HCI[0]);
+
 	int device = hci_open_dev(cfg.HCI[0]);
 	char resetString[25];
 
@@ -321,7 +338,7 @@ int DeviceFinder(Config cfg) {
 		return -1;
 	}
 
-	printf("Using bluetooth device %d and will scan for up to %d seconds or %d devices are found.", device, cfg.initial_scan_time, cfg.max_devices);
+	printf("Using HCI%d (fd:%d) and will scan for up to %d seconds or %d devices are found.", cfg.HCI[0], device, cfg.initial_scan_time, cfg.max_devices);
 	printf("\n");
 
 	// Get Results.
@@ -347,6 +364,8 @@ int DeviceFinder(Config cfg) {
 	if (cfg.mac_filter_en)
 		mac_filter = prepare_mac_manu_filters(&cfg);
 
+	printf("Minimum event size: %d\n", MinEventSize);
+
 	while ((now < EndTime) && (deviceCount < cfg.max_devices))
 	{
 		fd_set readfds;
@@ -361,10 +380,18 @@ int DeviceFinder(Config cfg) {
 			continue;
 		}
 
+		msgCount++;//This will include times the counter overrun, but in practice this never happens.
 
-		if (len >= HCI_EVENT_HDR_SIZE)
+		//if (len >= HCI_EVENT_HDR_SIZE)
+		//Lets be more agressive here. We're only looking for responses, so they should be considerably larger.
+		if (len >= MinEventSize)
 		{
-			msgCount++;
+			//moved this up the chain as it's a quick kick out.
+			meta_event = (evt_le_meta_event*)(buf + HCI_EVENT_HDR_SIZE + 1);
+			if (meta_event->subevent != EVT_LE_ADVERTISING_REPORT)
+				continue;
+
+			
 			// A fast catch to get rid of messages that don't even have our mac.
 			// Is the mac even in the buffer?
 			if (cfg.mac_filter_en)
@@ -386,102 +413,99 @@ int DeviceFinder(Config cfg) {
 				}
 			}
 
-			meta_event = (evt_le_meta_event*)(buf + HCI_EVENT_HDR_SIZE + 1);
-			if (meta_event->subevent == EVT_LE_ADVERTISING_REPORT)
+
+			uint8_t reports_count = meta_event->data[0];
+			void* offset = meta_event->data + 1;
+			int done = FALSE;
+			// int filtered = FALSE;
+			// while (reports_count-- && !known && !filtered)
+			while (reports_count-- && !done)
 			{
-				uint8_t reports_count = meta_event->data[0];
-				void* offset = meta_event->data + 1;
-				int done = FALSE;
-				// int filtered = FALSE;
-				// while (reports_count-- && !known && !filtered)
-				while (reports_count-- && !done)
+				info = (le_advertising_info*)offset;
+				offset = info->data + info->length + 2; // We have our info, advance here instead of later in case of continue
+
+				// Quick kick, we only want responses as we want the device name.
+				if (info->evt_type != 0x04)
 				{
-					info = (le_advertising_info*)offset;
-					offset = info->data + info->length + 2; // We have our info, advance here instead of later in case of continue
+					continue; // back to start of while loop. Check next report for the event type.
+				}
 
-					// Quick kick, we only want responses as we want the device name.
-					if (info->evt_type != 0x04)
+				//This second mac filter adds processing time and will rarely be hit.
+				//Chances of the mac address being in a packet, but it not being the mac of the device are very low.
+				//However it *will* happen eventually, so this removes these packets.
+				if (cfg.mac_filter_en)
+				{
+					int found = FALSE;
+					for (int i = 0; i < mac_filter.count; i++)
 					{
-						continue; // back to start of while loop. Check next report for the event type.
-					}
-
-					//This second mac filter adds processing time and will rarely be hit.
-					//Chances of the mac address being in a packet, but it not being the mac of the device are very low.
-					//However it *will* happen eventually, so this removes these packets.
-					if (cfg.mac_filter_en)
-					{
-						int found = FALSE;
-						for (int i = 0; i < mac_filter.count; i++)
+						// info->bdaddr.b is the raw MAC bytes, compare directly
+						if (memcmp(&info->bdaddr.b[3], mac_filter.bytes[i], 3) == 0)
 						{
-							// info->bdaddr.b is the raw MAC bytes, compare directly
-							if (memcmp(&info->bdaddr.b[3], mac_filter.bytes[i], 3) == 0)
-							{
-								found = TRUE;
-								break;
-							}
-						}
-						if (!found)
-						{
-							debugSecondFilterTest++;
-							continue;
-						}
-					}
-
-					char addr[18];
-					ba2str(&(info->bdaddr), addr);
-					// Check if we already know this device.
-					for (int i = 0; i < deviceCount; i++)
-					{
-						if (strncmp(devices[i].mac, addr, 17) == 0)
-						{
-							devices[i].count++;
-							done = TRUE;
+							found = TRUE;
 							break;
 						}
 					}
-					if (done)
-						continue; // Get out of our nested loop above and back to the next device.
-					//NOTE: Need to clean up break/continue conditions and names
-
-					int i = 0;
-					while (i < info->length)
+					if (!found)
 					{
-						uint8_t len = info->data[i];
-						uint8_t type = info->data[i + 1];
-						if (type == 0x08 || type == 0x09)//Name
+						debugSecondFilterTest++;
+						continue;
+					}
+				}
+
+				char addr[18];
+				ba2str(&(info->bdaddr), addr);
+				// Check if we already know this device.
+				for (int i = 0; i < deviceCount; i++)
+				{
+					if (strncmp(devices[i].mac, addr, 17) == 0)
+					{
+						devices[i].count++;
+						done = TRUE;
+						break;
+					}
+				}
+				if (done)
+					continue; // Get out of our nested loop above and back to the next device.
+				//NOTE: Need to clean up break/continue conditions and names
+
+				int i = 0;
+				while (i < info->length)
+				{
+					uint8_t len = info->data[i];
+					uint8_t type = info->data[i + 1];
+					if (type == 0x08 || type == 0x09)//Name
+					{
+						char name[32] = { 0 };
+						int data_len = len - 1;
+						for (int j = 0; j < data_len && j < 31; j++)
 						{
-							char name[32] = { 0 };
-							int data_len = len - 1;
-							for (int j = 0; j < data_len && j < 31; j++)
-							{
-								name[j] = info->data[i + 2 + j];
-							}
+							name[j] = info->data[i + 2 + j];
+						}
 
-							// Need to do the name filter fairly late as this is where we finally have a name.
-							// At this point we filtered out all the baddies, so this shouldn't be hit too hard.
-							if (cfg.name_filter_en)
+						// Need to do the name filter fairly late as this is where we finally have a name.
+						// At this point we filtered out all the baddies, so this shouldn't be hit too hard.
+						if (cfg.name_filter_en)
+						{
+							if (strncmp(name, cfg.name_filter, strlen(cfg.name_filter)) != 0)
 							{
-								if (strncmp(name, cfg.name_filter, strlen(cfg.name_filter)) != 0)
-								{
-									break;
-								}
-							}
-
-							if (!find_or_add(addr, name, deviceCount))
-							{
-								deviceCount++;
-								if (cfg.verbose)
-								{
-									printf("New!:%s - Name: %-30s - Devices found: %-3d - Time Remain: %d",
-										addr, name, deviceCount, (EndTime - now));
-									printf("\n");
-								}
+								break;
 							}
 						}
-						i += len + 1; // only reached if type didn't match
-					}
 
+						if (!find_or_add(addr, name, deviceCount))
+						{
+							deviceCount++;
+							if (cfg.verbose)
+							{
+								printf("New!:%s - Name: %-30s - Devices found: %-3d - Time Remain: %d",
+									addr, name, deviceCount, (EndTime - now));
+								printf("\n");
+							}
+						}
+					}
+					i += len + 1; // only reached if type didn't match
 				}
+
 			}
 		}
 		now = (unsigned)time(NULL);
