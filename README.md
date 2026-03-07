@@ -31,7 +31,8 @@ This collation of the information also makes it much easier to process for the r
 
 **Current state?**
 
-Currently QikBTSniff is at V0.01, this version will currently preform the active scan session as per the settings in the configuration file.
+Currently QikBTSniff is at V0.7, this version will currently preform the active scan session as per the settings in the configuration file.
+It will then search for the devices found in the active scan passively, and show a summary of the packets that would be sent over TCP after the TCP send interval is hit (TCP send code is the next milestone). At this point, it's functionally 90% done.
 If you'd like to try this, the latest compiled version is in the bin folder. Just download QikBTSniff and QikBTSniff.cfg to the same folder on your Linux machine and run with ./QikBTSniff 
 Currently only tested on Ubuntu 24.04, but the main dependencies have been included with Ubuntu since 14.
 The application needs su due to interacting with HCI.
