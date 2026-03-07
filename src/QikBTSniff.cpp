@@ -6,10 +6,12 @@
 
 // Copyright (c) 2026 iBrake
 // See: https://github.com/iBrake/QikBTSniff
-
 #include <stdlib.h>
 #include <time.h> //Calculating scan time.
 #include "BTScan.h"
+#include "ThreadedQueue.h" // Our queue stuff
+#include <thread> //Std stuff for the thread queue
+#include <vector> //Std stuff for the thread queue
 
 #define	TRUE 1
 #define	FALSE 0
@@ -33,7 +35,7 @@ void load_config(const char* filename, Config* config, int verbose);
 
 
 int main(){
-	printf("\nQikBTSniff Starting...\n");
+	printf("\nQikBTSniff V0.7 Starting...\n");
 
 	Config config;
 	load_config("QikBTSniff.cfg", &config, TRUE);
@@ -55,24 +57,171 @@ int main(){
 		}
 	}
 
+	//Need to convert our devices into a struct to save the packet data.
+	//I should have thought about the formatting of the MAC earlier to make it more universal across sections, but no big deal to fix it.
+	BluetoothPacket devicePacketsRecv[deviceCount];
+	memset(devicePacketsRecv, 0, sizeof(devicePacketsRecv));
+
+	for (int i = 0; i < deviceCount; i++)
+	{
+		//Convert MAC from string "AA:BB:CC:DD:EE:FF" to bytes
+		//Remember that we're going to get the MAC reversed.
+		sscanf(devices[i].mac, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+			   &devicePacketsRecv[i].MAC[5], &devicePacketsRecv[i].MAC[4],
+			   &devicePacketsRecv[i].MAC[3], &devicePacketsRecv[i].MAC[2],
+			   &devicePacketsRecv[i].MAC[1], &devicePacketsRecv[i].MAC[0]);
+		strncpy(devicePacketsRecv[i].name, devices[i].name, sizeof(devicePacketsRecv[i].name));
+	}
+
 	DeviceMacsToFind DMTF = build_mac_dev_filters(devices, deviceCount);
-	//printf("\n--- Formatted MACs for filter ---\n");
-
-	//for (int i = 0; i < DMTF.count; i++) //.count in case broken MACs passed in, but this shouldn't happen.
-	//{
-	//	printf("%02X:%02X:%02X:%02X:%02X:%02X\n",
-	//		DMTF.bytes[i][0],
-	//		DMTF.bytes[i][1],
-	//		DMTF.bytes[i][2],
-	//		DMTF.bytes[i][3],
-	//		DMTF.bytes[i][4],
-	//		DMTF.bytes[i][5]);
-	//}
-
 	printf("\nLauching ad finder\n");
+	//Setup our queue for the scanning threads.
+	ThreadSafeQueue <BluetoothPacket> queue;
+	//AdFinder(int HCI, DeviceMacsToFind MacsToFind, int Timeout, int intervalms, int debug_lvl, BluetoothPacket) {
+	std::vector<std::thread>threads;
+	int scantime = 71;
+	for (int i = 0; i < config.HCICount; i++) {
+		if(scantime > 100) scantime = (scantime - 50);
+		threads.emplace_back([&, i, scantime]() { //[&] — capture everything by reference. Need to ensure some get a hard value
+			AdFinder(config.HCI[i], DMTF, config.bt_restart_timer, scantime, config.verbose, queue);
+			});
+		scantime += 21;
+	}
 
-	//AdFinder(int HCI, DeviceMacsToFind MacsToFind, int Timeout, int intervalms, int debug_lvl) {
-	AdFinder(config.HCI[0], DMTF, 300, 70, 3);
+	unsigned now = (unsigned)time(NULL);
+	unsigned TCPSendTime = (unsigned)time(NULL);
+	unsigned namesPickedUp = 0;
+	while(1){
+		unsigned TCPSendTime = now + config.msg_collate_time;
+		while (now<TCPSendTime)
+		{//This is problamatic, we need messages to come in to update now...
+			now = (unsigned)time(NULL);
+			if(config.verbose> 2)printf("Will send next TCP packet in %d seconds\n", (TCPSendTime - now));
+			BluetoothPacket pkt = queue.pop(); // blocks until data available
+			uint16_t uuid = 0;
+			int i = 0;
+			//I struggled with getting the UUID from packets for way too long.
+			//It got really obnoxious with sensors that use FF (manufacturer specific)
+			//To make this as versatile as possible, we're going to make a UUID out of the ad type and length
+			//Even for FF packets, this gives us a good chance of being able to differentiate the types.
+			//Also had issues with even standard packets where the UUID was in odd positions, so this solves multiple issues.
+			//The main thing we'll need to skip is the flags.This means byte 1 or 4 will usually be the type.
+			uint8_t ad_type = 0;
+			while (i < pkt.data_len) {
+				uint8_t ad_len  = pkt.data[i];
+				ad_type = pkt.data[i + 1];
+				if (ad_type != 0x01) { //skip flags, take the first real structure
+					uuid = (ad_type << 8) | ad_len;
+					break;
+				}
+				i += ad_len + 1;
+			}
+
+			if(ad_type == 0x08 || ad_type == 0x09){
+				namesPickedUp++;
+				continue;
+			}
+
+
+			if ((uuid == 0)||(uuid == 0))  // not ad type we want.
+			{
+				if (config.verbose > 1)
+				{
+					printf("[HCI%d] No UUID found, skipping:", pkt.hciNo);
+					for (int i = 0; i < pkt.data_len; i++)
+					{
+						printf("%02X,", pkt.data[i]);
+					}
+				
+				}
+				continue; // back to start of while loop (queue.pop)
+			}
+
+			// Lets store our data for sending later.
+			// First, Find device by MAC
+			for (int i = 0; i < deviceCount; i++)
+			{
+				if (memcmp(pkt.MAC, devicePacketsRecv[i].MAC, 6) == 0)
+				{
+					// Find existing UUID slot or create new one
+					BluetoothPacket &CurrDev = devicePacketsRecv[i];
+					UUIDRecord *target = nullptr;
+					for (int j = 0; j < CurrDev.uuid_count; j++)
+					{
+						if (CurrDev.uuids[j].uuid == uuid)
+						{
+							target = &CurrDev.uuids[j]; // existing UUID, overwrite data for it
+							break;
+						}
+					}
+					if (target == nullptr && CurrDev.uuid_count < 16)
+					{
+						target = &CurrDev.uuids[CurrDev.uuid_count++]; // new UUID slot created
+						target->uuid = uuid;
+					}
+					if (target != nullptr)
+					{
+						memcpy(target->data, pkt.data, pkt.data_len);//write our data to new or existing slot.
+						target->data_len = pkt.data_len;
+						target->count += 1;
+					}
+					break;
+				}
+			}
+
+			if (config.verbose > 2)
+			{ // print packet
+				printf("[HCI%d] PKT RECVD: UUID-%02X MAC-%02X:%02X:%02X:%02X:%02X:%02X  len-%d  payload-",
+						uuid,
+						pkt.hciNo,
+						pkt.MAC[0], pkt.MAC[1], pkt.MAC[2], pkt.MAC[3], pkt.MAC[4], pkt.MAC[5],
+						pkt.data_len);
+				for (int i = 0; i < pkt.data_len; i++)
+					printf("%02x ", pkt.data[i]);
+				printf("\n");
+			}		
+			unsigned now = (unsigned)time(NULL);
+		}
+
+		//TCP send time!
+		unsigned devicesDetected = deviceCount;
+		if (config.verbose > 0)
+		{
+			printf("TCP sending:\n");
+			for (int i = 0; i < deviceCount; i++)
+			{
+				printf("Dev: %s - ", devicePacketsRecv[i].name);
+				if(devicePacketsRecv[i].uuid_count > 0){
+				for (int j = 0; j < devicePacketsRecv[i].uuid_count; j++)
+				{
+					printf(" 0x%04X(%d) ",
+						   devicePacketsRecv[i].uuids[j].uuid,
+						   devicePacketsRecv[i].uuids[j].count);
+				}
+			}else{
+				printf(" None!");
+				devicesDetected--;//Cheap way to see how many devices got no packets.
+			}
+				printf("\n");
+			}
+			//have this in as I found it interesting that sensors can still be sending their name long after the active scan has finished.
+			printf("Picked up %d name packets during passive scan.\n", namesPickedUp);
+		}
+		else
+		{
+			printf("TCP send for %d devices out of %d", devicesDetected, deviceCount);
+			printf("\n");
+		}
+		
+		//Clear out the packets recieved for the next run.
+		for (int i = 0; i < deviceCount; i++)
+		{
+			memset(devicePacketsRecv[i].uuids, 0, sizeof(devicePacketsRecv[i].uuids));
+			devicePacketsRecv[i].uuid_count = 0;
+		}
+		namesPickedUp = 0;
+	}
+
 }
 
 void load_config(const char* filename, Config* config, int verbose) {
@@ -146,10 +295,10 @@ void load_config(const char* filename, Config* config, int verbose) {
 
 	printf("--------CONFIG LOADED-----------\n");
 	//printf("%s",HCICharTemp);
-	printf("HCI device(s):");
+	printf("HCIdevice(s):");
     for (int i = 0; i < (config->HCICount); i++)
     {
-        printf("%d,", config->HCI[i]);
+        printf("%d ", config->HCI[i]);
     }
 	printf("\n");
 	if (verbose > 0) {
@@ -171,7 +320,6 @@ void load_config(const char* filename, Config* config, int verbose) {
 			printf("\n");
 	}
 	printf("--------------------------------\n");
-
     fclose(f);
 }
 

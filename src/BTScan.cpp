@@ -13,6 +13,7 @@ struct hci_request ble_hci_request(uint16_t ocf, int clen, void* status, void* c
 	return rq;
 }
 
+
 DeviceInfo devices[1000];
 //Used for our device list generation.
 int find_or_add(const char* mac, const char* name, int deviceCount) {
@@ -148,161 +149,155 @@ int bt_start_scan(int device, int* status, int enable, int interval, int ScanTyp
 	return 0;
 }
 
-int AdFinder(int HCI, DeviceMacsToFind MacsToFind, int Timeout, int intervalms, int debug_lvl) {
+int AdFinder(int HCI, DeviceMacsToFind MacsToFind, int Timeout, int intervalms, int debug_lvl, ThreadSafeQueue<BluetoothPacket>& queue){
 
 	int ret, status;
 	unsigned now = (unsigned)time(NULL);
 	unsigned StartTime = (unsigned)time(NULL);
-
-	int device = hci_open_dev(HCI);
 	char resetString[25];
 
-	sprintf(resetString, "hciconfig hci%d reset", HCI);
-	//printf("%s\n", resetString);
-	//There's odd things that can happen where the adapter gets stuck. A reset can help.
-	if (system(resetString) != 0) {
-		printf("Device Reset failed\n");
-	}
-
-	ret = bt_start_scan(device, &status, TRUE, (intervalms / 0.625), 0x00);
-	if (ret < 0) {
-		if (errno == EACCES || errno == EPERM) {
-			fprintf(stderr, "HCI Permission denied. Try running as root.\n");
-		}
-		else
+	while (1)
+	{ // Infinite scanning loop, might put something in here so main thread can stop this
+		int device = hci_open_dev(HCI);
+		sprintf(resetString, "hciconfig hci%d reset", HCI);
+		unsigned restartTime = now + Timeout;
+		// printf("%s\n", resetString);
+		// There's odd things that can happen where the adapter gets stuck. A reset can help.
+		if (system(resetString) != 0)
 		{
-			perror("Failed to set scan parameters data");
-		}
-		return -1;
-	}
-
-	if (debug_lvl) {
-		printf("Using bluetooth device %d, and resetting every %d seconds.", device, Timeout);
-		printf("\n");
-	}
-
-	// Get Results.
-	struct hci_filter nf;
-	hci_filter_clear(&nf);
-	hci_filter_set_ptype(HCI_EVENT_PKT, &nf);
-	hci_filter_set_event(EVT_LE_META_EVENT, &nf);
-	if (setsockopt(device, SOL_HCI, HCI_FILTER, &nf, sizeof(nf)) < 0) {
-		hci_close_dev(device);
-		perror("Could not set socket options\n");
-		return -1;
-	}
-
-	uint8_t buf[HCI_MAX_EVENT_SIZE];
-	evt_le_meta_event* meta_event;
-	le_advertising_info* info;
-	int len;
-	int MsgCount = 0;
-
-
-	////Testing out a first byte bucket to see if we get a speed boost.
-	//If we have a boost from this, it's very small, it's not doing any harm at least, so will leave it.
-	//Think I'm currently at what we can realistically handle in terms of messages per second, per adapter now.
-	//FUTHER UPDATE:
-	//Using just one byte was a mistake, as:
-	// 1. It can be 00, which appears very frequently in packets.
-	// 2. At least for my 10 devices, the last byte can be similar, even the same. (probably the maufacturer masking some bits?)
-	//Going to switch to using the last byte of the manufacturer ID and the first byte of the Maufacturer data.
-	//The manufacturer byte is unlikely to be 00, and the data part is more likely to be random.
-	uint64_t buckets[256][256] = { 0 };
-
-	// Build index using bytes 4 and 5
-	for (int i = 0; i < MacsToFind.count; i++)
-		buckets[MacsToFind.bytes[i][4]][MacsToFind.bytes[i][5]] |= (1ULL << i);
-
-
-	while (MsgCount < 1000)
-	{
-		fd_set readfds;
-		FD_ZERO(&readfds);
-		FD_SET(device, &readfds);
-		struct timeval tv = { 0, 100000 };  // must be reset each iteration
-		if (select(device + 1, &readfds, NULL, NULL, &tv) > 0) {
-			len = read(device, buf, sizeof(buf));
-		}
-		else {
-			now = (unsigned)time(NULL);
-			continue;
+			printf("<HCI%d> Device Reset failed\n",HCI);
 		}
 
-
-		if (len >= MinEventSize)
+		ret = bt_start_scan(device, &status, TRUE, (intervalms / 0.625), 0x00);
+		if (ret < 0)
 		{
-			/* Before trying first byte bucket
-			for (int i = 0; i < MacsToFind.count; i++)
+			if (errno == EACCES || errno == EPERM)
 			{
-				uint8_t* match = memmem(buf, len, MacsToFind.bytes[i], 6);
-				*/
-			for (int pos = 0; pos < len - 5; pos++)
+				fprintf(stderr, "<HCI%d> HCI Permission denied. Try running as root.\n",HCI);
+			}
+			else
 			{
-				uint64_t candidates = buckets[buf[pos + 4]][buf[pos + 5]];
-				while (candidates)
+				printf("<HCI:%d> ",HCI);
+				perror("Failed to set scan parameters data");
+			}
+			return -1;
+		}
+
+		if (debug_lvl)
+		{
+			printf("<HCI%d> (Re)Starting scan with device %d. Resetting every %d seconds. IV: %d",HCI, device, Timeout, intervalms);
+			printf("\n");
+		}
+
+		// Get Results.
+		struct hci_filter nf;
+		hci_filter_clear(&nf);
+		hci_filter_set_ptype(HCI_EVENT_PKT, &nf);
+		hci_filter_set_event(EVT_LE_META_EVENT, &nf);
+		if (setsockopt(device, SOL_HCI, HCI_FILTER, &nf, sizeof(nf)) < 0)
+		{
+			hci_close_dev(device);
+			perror("<HCI%d> Could not set socket options\n");
+			return -1;
+		}
+
+		uint8_t buf[HCI_MAX_EVENT_SIZE];
+		evt_le_meta_event *meta_event;
+		le_advertising_info *info;
+		int len;
+		int MsgCount = 0;
+
+		// Going to switch to using the last byte of the manufacturer ID and the first byte of the Maufacturer data.
+		// The manufacturer byte is unlikely to be 00, and the data part is more likely to be random.
+		
+		uint64_t buckets[256][256] = {0};
+		// Build index using bytes 4 and 5
+		for (int i = 0; i < MacsToFind.count; i++)
+			buckets[MacsToFind.bytes[i][4]][MacsToFind.bytes[i][5]] |= (1ULL << i);
+
+
+		now = (unsigned)time(NULL);
+		while (now < restartTime)
+		{
+			fd_set readfds;
+			FD_ZERO(&readfds);
+			FD_SET(device, &readfds);
+			struct timeval tv = {0, 100000}; // must be reset each iteration
+			if (select(device + 1, &readfds, NULL, NULL, &tv) > 0)
+			{
+				len = read(device, buf, sizeof(buf));
+			}
+			else
+			{
+				now = (unsigned)time(NULL);
+				continue;
+			}
+
+			if (len >= MinEventSize)
+			{
+				/* Before trying first byte bucket
+				for (int i = 0; i < MacsToFind.count; i++)
 				{
-					int i = __builtin_ctzll(candidates);
-					candidates &= candidates - 1;
-					if (memcmp(&buf[pos], MacsToFind.bytes[i], 6) == 0)
+					uint8_t* match = memmem(buf, len, MacsToFind.bytes[i], 6);
+					*/
+				for (int pos = 0; pos < len - 5; pos++)
+				{
+					uint64_t candidates = buckets[buf[pos + 4]][buf[pos + 5]];
+					while (candidates)
 					{
-						uint8_t* match = &buf[pos];
-						//printf("match! %d\n", MsgCount);
-						MsgCount++;
-						//data length byte immediately follows the 6 byte MAC
-						uint8_t* data_len_ptr = match + 6;
-
-						if (data_len_ptr < buf + len)//In case of corrupt buffer. NB: memory pointers!! so checking that the ptr isn't telling us to go beyond the data we have.
+						int i = __builtin_ctzll(candidates);
+						candidates &= candidates - 1;
+						if (memcmp(&buf[pos], MacsToFind.bytes[i], 6) == 0)
 						{
-							uint8_t data_len = *data_len_ptr;
-							if (data_len_ptr + 1 + data_len <= buf + len)
-								//previous check seems pointless with this here, but we need to do previous check first to ensure data_len_ptr isn't rubbish, as this could then make us think this is valid...
+							uint8_t *match = &buf[pos];
+							// printf("match! %d\n", MsgCount);
+							MsgCount++;
+							// data length byte immediately follows the 6 byte MAC
+							uint8_t *data_len_ptr = match + 6;
+
+							if (data_len_ptr < buf + len) // In case of corrupt buffer. NB: memory pointers!! so checking that the ptr isn't telling us to go beyond the data we have.
 							{
-								uint8_t* payload = data_len_ptr + 1;
-								//payload is now pointing at data_len bytes of advertising data
-								//Can pass back to our coallating thread now.
-								//if (debug_lvl > 2) {
+								uint8_t data_len = *data_len_ptr;
+								if (data_len_ptr + 1 + data_len <= buf + len)
+								// previous check seems pointless with this here, but we need to do previous check first to ensure data_len_ptr isn't rubbish, as this could then make us think this is valid...
+								{
+									uint8_t *payload = data_len_ptr + 1;
+									// payload is now pointing at data_len bytes of advertising data
+									// Can pass back to our coallating thread now.
+									BluetoothPacket PL;
+									PL.hciNo = HCI;
+									memcpy(PL.MAC, MacsToFind.bytes[i], 6);
+									PL.data_len = *data_len_ptr;
+									memcpy(PL.data, payload, PL.data_len);
 
-								//	printf("MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
-								//		MacsToFind.bytes[i][0],
-								//		MacsToFind.bytes[i][1],
-								//		MacsToFind.bytes[i][2],
-								//		MacsToFind.bytes[i][3],
-								//		MacsToFind.bytes[i][4],
-								//		MacsToFind.bytes[i][5]);
+									queue.push(PL);
 
-								//	printf("Payload (%d bytes from %d bytes): ", data_len, len);
-								//	for (int i = 0; i < data_len; i++)
-								//	{
-								//		printf("%02X,", payload[i]);
-								//	}
-									printf("\nMsg:%d\n", MsgCount);
-								//}
+								}
 							}
 						}
-					
 					}
 				}
 			}
 		}
-	}
 		// Disable scanning.
 		ret = bt_start_scan(device, &status, FALSE, 0, 0);
-		if (ret < 0) {
+		if (ret < 0)
+		{
 			hci_close_dev(device);
-			perror("Failed to disable scan.");
+			printf("<HCI:%d>",HCI);
+			perror(" Failed to disable scan.");
 			return -1;
 		}
-		else {
-			printf("Closed scan!\n");
+		else
+		{
+		if(debug_lvl>2)printf("<HCI%d> Closed scan!\n",HCI);
 		}
 
 		hci_close_dev(device);
-
-		return 1;
+		sleep(0.2);
+		// return 1;
+	}
 }
-
-
 
 
 int DeviceFinder(Config cfg) {
@@ -338,7 +333,7 @@ int DeviceFinder(Config cfg) {
 		return -1;
 	}
 
-	printf("Using HCI%d (fd:%d) and will scan for up to %d seconds or %d devices are found.", cfg.HCI[0], device, cfg.initial_scan_time, cfg.max_devices);
+	printf("Using HCI%d and will scan for up to %d seconds or %d devices are found.", cfg.HCI[0], cfg.initial_scan_time, cfg.max_devices);
 	printf("\n");
 
 	// Get Results.
