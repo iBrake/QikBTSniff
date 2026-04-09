@@ -1,0 +1,20 @@
+[Unit]
+Description=QikBTSniff
+After=bluetooth.target dbus.service
+Requires=bluetooth.service
+After=network.target
+
+[Service]
+Type=simple
+Environment=STDBUF_MODE=0
+ExecStart=/usr/bin/stdbuf -oL /usr/local/bin/QikBTSniff/QikBTSniff
+WorkingDirectory=/usr/local/bin/QikBTSniff
+User=root
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/qikbtsniff.log
+StandardError=append:/var/log/qikbtsniff.log
+#ExecStartPre=/bin/sleep 60
+
+[Install]
+WantedBy=multi-user.target
