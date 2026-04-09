@@ -56,6 +56,104 @@ MacFilter prepare_mac_manu_filters(Config* cfg) {
 	return result;
 }
 
+char* get_adapter_name(int hci_id, int debug) {
+    static char out[256];
+    memset(out, 0, sizeof(out));
+
+    if (hci_id < 0 || hci_id > 31) {
+        snprintf(out, sizeof(out), "invalid");
+        return out;
+    }
+
+    // --- Step 1: Get BD_ADDR and adapter name via libbluetooth ---
+    struct hci_dev_info di;
+    char bt_addr[18] = "??:??:??:??:??:??";
+    char bt_name[32]  = "unknown";
+    if (hci_devinfo(hci_id, &di) == 0) {
+        ba2str(&di.bdaddr, bt_addr);
+        strncpy(bt_name, di.name, sizeof(bt_name));
+    }
+
+    // --- Step 2: Get idVendor / idProduct from sysfs ---
+    char raw_path[256], real_path[256];
+    char vendor_str[8] = "????", product_str[8] = "????";
+    char busnum[8] = "", devnum[8] = "";
+
+    FILE* f;
+
+    snprintf(raw_path, sizeof(raw_path), "/sys/class/bluetooth/hci%d/device/../idVendor", hci_id);
+    if (realpath(raw_path, real_path) != NULL) {
+        f = fopen(real_path, "r");
+        if (f) { fscanf(f, "%s", vendor_str);  fclose(f); }
+    }
+
+    snprintf(raw_path, sizeof(raw_path), "/sys/class/bluetooth/hci%d/device/../idProduct", hci_id);
+    if (realpath(raw_path, real_path) != NULL) {
+        f = fopen(real_path, "r");
+        if (f) { fscanf(f, "%s", product_str); fclose(f); }
+    }
+
+    snprintf(raw_path, sizeof(raw_path), "/sys/class/bluetooth/hci%d/device/../busnum", hci_id);
+    if (realpath(raw_path, real_path) != NULL) {
+        f = fopen(real_path, "r");
+        if (f) { fscanf(f, "%s", busnum); fclose(f); }
+    }
+
+    snprintf(raw_path, sizeof(raw_path), "/sys/class/bluetooth/hci%d/device/../devnum", hci_id);
+    if (realpath(raw_path, real_path) != NULL) {
+        f = fopen(real_path, "r");
+        if (f) { fscanf(f, "%s", devnum); fclose(f); }
+    }
+
+    //printf("Looking for bus:%s dev:%s\n", busnum, devnum);
+
+    // --- Step 3: Get human readable name from lsusb ---
+    char usb_name[128] = "unknown";
+
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "lsusb -s %s:%s", busnum, devnum);
+    FILE *pipe = popen(cmd, "r");
+    if (pipe) {
+        char lsusb_line[256] = "";
+		fgets(lsusb_line, sizeof(lsusb_line), pipe);
+		pclose(pipe);
+
+		char vendor_name[64] = "";
+		char full_name[128] = "";
+
+		//Line: "Bus 001 Device 005: ID 2357:0604 TP-Link TP-Link UB500 Adapter"
+		//Skip past "ID xxxx:xxxx " to get to the names
+
+		char *id_pos = strstr(lsusb_line, vendor_str);
+		if (id_pos)
+		{
+			id_pos += 10;						 //skip "2357:0604 "
+			sscanf(id_pos, "%63s", vendor_name); //grab vendor name e.g. "TP-Link"
+			strncpy(full_name, id_pos, sizeof(full_name));
+			full_name[strcspn(full_name, "\n")] = 0;
+
+			//Annoyingly, TP-Link puts there vendor name in the product ID as well.
+			//This should remove that by checking if it appears at the start and moving the char[]
+			char double_vendor[128];
+			snprintf(double_vendor, sizeof(double_vendor), "%s %s", vendor_name, vendor_name);
+			if (strncasecmp(full_name, double_vendor, strlen(double_vendor)) == 0)
+			{
+				memmove(full_name, full_name + strlen(vendor_name) + 1,
+						strlen(full_name) - strlen(vendor_name));
+			}
+			strncpy(usb_name, full_name, sizeof(usb_name));
+		}
+	}
+
+	if(debug)
+		printf("DEBUG: HCI%d: [%s] BD_ADDR: %s  USB: %s:%s (%s)\n",
+             hci_id, bt_name, bt_addr, vendor_str, product_str, usb_name);
+
+	snprintf(out, sizeof(out), "HCI%d:(%s)",hci_id, usb_name);
+
+    return out;
+}
+
 //This is the full device macs we want to find in LSB for searching through the HCI packet in passive scan mode.
 DeviceMacsToFind build_mac_dev_filters(DeviceInfo* devices, int device_count)
 {

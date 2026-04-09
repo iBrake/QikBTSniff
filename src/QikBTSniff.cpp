@@ -12,6 +12,13 @@
 #include "ThreadedQueue.h" // Our queue stuff
 #include <thread> //Std stuff for the thread queue
 #include <vector> //Std stuff for the thread queue
+//Below included for json formatting.
+//#include <cstdio>
+//Below for TCP send
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
 
 #define	TRUE 1
 #define	FALSE 0
@@ -32,7 +39,8 @@ typedef struct {
 
 
 void load_config(const char* filename, Config* config, int verbose);
-
+char* buildJSON(BluetoothPacket* devicePacketsRecv, int deviceCount);
+void prettyPrintJSON(const char* json);
 
 int main(){
 	printf("\nQikBTSniff V0.7 Starting...\n");
@@ -73,6 +81,23 @@ int main(){
 		strncpy(devicePacketsRecv[i].name, devices[i].name, sizeof(devicePacketsRecv[i].name));
 	}
 
+	//get the BT device names first.
+	printf("Bluetooth devices:\n");
+	for (int i = 0; i < config.HCICount; i++)
+	{
+		char *name = get_adapter_name(config.HCI[i],FALSE);
+		if (name != NULL)
+		{
+			strncpy(config.BT_names[i], name, 64);
+		}
+		else
+		{
+			snprintf(config.BT_names[i], 64, "HCI%d", config.HCI[i]); //fallback
+			//printf("Fell back when finding adapter name\n");
+		}
+		printf("%s\n",config.BT_names[i]);
+	}
+
 	DeviceMacsToFind DMTF = build_mac_dev_filters(devices, deviceCount);
 	printf("\nLauching ad finder\n");
 	//Setup our queue for the scanning threads.
@@ -82,8 +107,9 @@ int main(){
 	int scantime = 71;
 	for (int i = 0; i < config.HCICount; i++) {
 		if(scantime > 100) scantime = (scantime - 50);
-		threads.emplace_back([&, i, scantime]() { //[&] — capture everything by reference. Need to ensure some get a hard value
-			AdFinder(config.HCI[i], DMTF, config.bt_restart_timer, scantime, config.verbose, queue);
+		int HCIDev = config.HCI[i];//there was an odd threading issue passing this true, so created this.
+		threads.emplace_back([&,scantime, HCIDev]() { //[&] — capture everything by reference. Need to ensure some get a hard value
+			AdFinder(HCIDev, DMTF, config.bt_restart_timer, scantime, config.verbose, queue);
 			});
 		scantime += 21;
 	}
@@ -91,6 +117,7 @@ int main(){
 	unsigned now = (unsigned)time(NULL);
 	unsigned TCPSendTime = (unsigned)time(NULL);
 	unsigned namesPickedUp = 0;
+	int HCI_MSG_RCV[32] = {0};//Just counting who got the most messages.
 	while(1){
 		unsigned TCPSendTime = now + config.msg_collate_time;
 		while (now<TCPSendTime)
@@ -137,6 +164,9 @@ int main(){
 				continue; // back to start of while loop (queue.pop)
 			}
 
+			//increment that our adapter got a fresh message.
+			HCI_MSG_RCV[pkt.hciNo] += 1;
+
 			// Lets store our data for sending later.
 			// First, Find device by MAC
 			for (int i = 0; i < deviceCount; i++)
@@ -180,14 +210,34 @@ int main(){
 					printf("%02x ", pkt.data[i]);
 				printf("\n");
 			}		
-			unsigned now = (unsigned)time(NULL);
+			now = (unsigned)time(NULL);
 		}
 
+		
+
 		//TCP send time!
+		//Build our JSON packet. Need to free the payload after send! Otherwise we'll probably have a memory leak type scenario.
+		char* payload = buildJSON(devicePacketsRecv, deviceCount);
+
 		unsigned devicesDetected = deviceCount;
+		if (config.verbose > 1)
+		{
+			prettyPrintJSON(payload);
+		}
+
+		char timeStr[20]; // "DD/MM/YYYY HH:MM:SS" + null
+		time_t t = time(NULL);
+		struct tm *currentTime = localtime(&t);
+		snprintf(timeStr, sizeof(timeStr), "%02d/%02d/%04d %02d:%02d:%02d",
+			currentTime->tm_mday, currentTime->tm_mon + 1, currentTime->tm_year + 1900,
+			currentTime->tm_hour, currentTime->tm_min, currentTime->tm_sec);
+
+				
+		//Nextbit is all different debug print stuff.
 		if (config.verbose > 0)
 		{
-			printf("TCP sending:\n");
+
+			printf(" --------- \nTCP sending at : %s\n",timeStr);
 			for (int i = 0; i < deviceCount; i++)
 			{
 				printf("Dev: %s - ", devicePacketsRecv[i].name);
@@ -204,15 +254,61 @@ int main(){
 			}
 				printf("\n");
 			}
-			//have this in as I found it interesting that sensors can still be sending their name long after the active scan has finished.
-			printf("Picked up %d name packets during passive scan.\n", namesPickedUp);
+			printf("Messages received per adapter:\n");
+			struct hci_dev_info di;
+			for (int i = 0; i < 32; i++) {
+				if (HCI_MSG_RCV[i] > 0) {
+					printf("%s - %d packets\n",config.BT_names[i], HCI_MSG_RCV[i]);
+					//delete for the next run
+					HCI_MSG_RCV[i] =0;
+				}
+			}
+			// have this in as I found it interesting that sensors can still be sending their name long after the active scan has finished.
+			printf("Picked up %d name packets during passive scan.\n --------- \n", namesPickedUp);
 		}
 		else
 		{
-			printf("TCP send for %d devices out of %d", devicesDetected, deviceCount);
+			printf("TCP send for %d devices out of %d.", devicesDetected, deviceCount);
 			printf("\n");
 		}
-		
+
+		//Debug finished.
+		//Actually send the packet now.
+		if (payload)
+		{
+			int sock = socket(AF_INET, SOCK_STREAM, 0);
+			if (sock < 0){
+				printf("\n!!!!!!!!!!!!\nTCP failed to create socket! Will try again on next run.\n!!!!!!!!!!!!\n");
+				break;
+			}
+
+			//get our IP and port from the config.
+			char ip[16];
+			int port;
+			sscanf(config.tcp_add, "%15[^:]:%d", ip, &port);	
+			struct sockaddr_in server;
+			server.sin_family = AF_INET;
+			server.sin_port = htons(port);
+			server.sin_addr.s_addr = inet_addr(ip);
+
+			if (connect(sock, (struct sockaddr *)&server, sizeof(server)) == 0)
+			{
+				int chk = send(sock, payload, strlen(payload), 0);
+				if(chk < 0){
+					printf("\n!!!!!!!!!!!!\nTCP send failed for %s! Will try again on next run.\n!!!!!!!!!!!!\n",config.tcp_add);
+				}else if(config.verbose >0){
+					printf("\nTCP sent successfully to %s at %s!\n",config.tcp_add,timeStr);
+				}
+			}else{
+				printf("\n!!!!!!!!!!!!\nTCP connect failed for %s! Will try again on next run.\n!!!!!!!!!!!!\n",config.tcp_add);
+			}
+
+			close(sock);//Do we need to actually close this since we'll use it again?- Yes. Otherwise it will create a new socket each run.
+						//Don't want to make the socket a constant in case it fails, probably not an issue creating a new sock everytime?
+		}else{
+			printf("\n!!!!!!!!!!!!\nNo payload to send!\n!!!!!!!!!!!!\n");
+		}
+
 		//Clear out the packets recieved for the next run.
 		for (int i = 0; i < deviceCount; i++)
 		{
@@ -220,9 +316,11 @@ int main(){
 			devicePacketsRecv[i].uuid_count = 0;
 		}
 		namesPickedUp = 0;
+		//free(payload);
 	}
 
 }
+
 
 void load_config(const char* filename, Config* config, int verbose) {
 
@@ -323,3 +421,83 @@ void load_config(const char* filename, Config* config, int verbose) {
     fclose(f);
 }
 
+
+
+char* buildJSON(BluetoothPacket* devicePacketsRecv, int deviceCount) {
+    size_t bufSize = 14 + (deviceCount * 1800);
+    char* out = (char*)malloc(bufSize);
+    if (!out) return NULL;
+
+    int pos = 0;
+
+    pos += snprintf(out + pos, bufSize - pos, "{\"devices\":{");
+
+    for (int i = 0; i < deviceCount; i++) {
+        BluetoothPacket& pkt = devicePacketsRecv[i];
+
+        char mac[18];
+        snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+            pkt.MAC[5], pkt.MAC[4], pkt.MAC[3],
+            pkt.MAC[2], pkt.MAC[1], pkt.MAC[0]);//lets reverse the MAC to normal format (AGAIN!)
+
+        pos += snprintf(out + pos, bufSize - pos, "\"%s\":{\"mac\":\"%s\",\"uuids\":{",
+            pkt.name, mac);
+
+        for (int j = 0; j < pkt.uuid_count; j++) {
+            UUIDRecord& rec = pkt.uuids[j];
+
+            char dataHex[65] = {0};
+            for (int k = 0; k < rec.data_len; k++) {
+                snprintf(dataHex + (k * 2), 3, "%02X", rec.data[k]);
+            }
+
+            pos += snprintf(out + pos, bufSize - pos, "\"0x%04X\":{\"data\":\"%s\"}",
+                rec.uuid, dataHex);
+
+            if (j < pkt.uuid_count - 1) pos += snprintf(out + pos, bufSize - pos, ",");
+        }
+
+        pos += snprintf(out + pos, bufSize - pos, "}}");
+        if (i < deviceCount - 1) pos += snprintf(out + pos, bufSize - pos, ",");
+    }
+
+    pos += snprintf(out + pos, bufSize - pos, "}}");
+    return out;
+}
+
+void prettyPrintJSON(const char* json) {//Need to see the json in a readable format!
+    int indent = 0;
+    bool inString = false;
+	printf("--------------------------------------\n");
+	printf("Pretty JSON of JSON that will be sent!\n");
+    for (int i = 0; json[i] != '\0'; i++) {
+        char c = json[i];
+
+        // Track whether we're inside a string so we don't format its contents
+        if (c == '"' && (i == 0 || json[i-1] != '\\')) inString = !inString;
+
+        if (!inString) {
+            if (c == '{' || c == '[') {
+                printf("%c\n", c);
+                indent++;
+                for (int j = 0; j < indent; j++) printf("  ");
+            } else if (c == '}' || c == ']') {
+                printf("\n");
+                indent--;
+                for (int j = 0; j < indent; j++) printf("  ");
+                printf("%c", c);
+            } else if (c == ',') {
+                printf(",\n");
+                for (int j = 0; j < indent; j++) printf("  ");
+            } else if (c == ':') {
+                printf(": ");
+            } else {
+                printf("%c", c);
+            }
+        } else {
+            printf("%c", c);
+        }
+    }
+    printf("\n");
+	printf("--------------------------------------\n");
+}
